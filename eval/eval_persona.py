@@ -213,10 +213,23 @@ async def eval_batched(questions, llm, tokenizer, coef, vector=None, layer=None,
     # Create a semaphore to limit concurrency
     semaphore = asyncio.Semaphore(max_concurrent_judges)
     
-    async def run_with_semaphore(task_idx, judge, question_text, answer):
+    async def run_with_semaphore(task_idx, judge, question_text, answer, max_retries=3, timeout_seconds=120):
         async with semaphore:
-            result = await judge(question=question_text, answer=answer)
-            return task_idx, result
+            for attempt in range(max_retries):
+                try:
+                    result = await asyncio.wait_for(
+                        judge(question=question_text, answer=answer),
+                        timeout=timeout_seconds
+                    )
+                    return task_idx, result
+                except (asyncio.TimeoutError, Exception) as e:
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt
+                        logging.warning(f"Judge task {task_idx} attempt {attempt+1} failed ({type(e).__name__}), retrying in {wait}s...")
+                        await asyncio.sleep(wait)
+                    else:
+                        logging.error(f"Judge task {task_idx} failed after {max_retries} attempts: {e}")
+                        return task_idx, None
     
     # Create all tasks with semaphore control
     tasks = [run_with_semaphore(task_idx, judge, question_text, answer) 

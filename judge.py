@@ -10,7 +10,7 @@ from config import setup_credentials
 
 # Set up credentials and environment
 config = setup_credentials()
-openai = AsyncOpenAI()
+openai = AsyncOpenAI(timeout=60, max_retries=5)
 
 
 
