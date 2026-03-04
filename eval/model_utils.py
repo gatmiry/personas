@@ -59,15 +59,36 @@ def load_model(model_path: str, dtype=torch.bfloat16):
         tok = _load_tokenizer(resolved)
     return model, tok
 
+def _valid_tp_size(model_id: str, max_gpus: int) -> int:
+    """Largest TP size <= max_gpus compatible with the model's head counts."""
+    from math import gcd
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    divisors = [
+        getattr(cfg, a, None)
+        for a in ("num_attention_heads", "num_key_value_heads")
+    ]
+    divisors = [d for d in divisors if d is not None]
+    if not divisors:
+        return max_gpus
+    limit = divisors[0]
+    for d in divisors[1:]:
+        limit = gcd(limit, d)
+    for tp in range(min(max_gpus, limit), 0, -1):
+        if limit % tp == 0:
+            return tp
+    return 1
+
 def load_vllm_model(model_path: str):
     from vllm import LLM
 
     if not os.path.exists(model_path):               # ---- Hub ----
+        tp = _valid_tp_size(model_path, torch.cuda.device_count())
         llm = LLM(
             model=model_path,
             enable_prefix_caching=True,
             enable_lora=True,
-            tensor_parallel_size=torch.cuda.device_count(),
+            tensor_parallel_size=tp,
             max_num_seqs=32,
             gpu_memory_utilization=0.9,
             max_model_len=30000,
@@ -87,11 +108,12 @@ def load_vllm_model(model_path: str):
     base_path = (PeftConfig.from_pretrained(resolved).base_model_name_or_path
                  if is_lora else resolved)
 
+    tp = _valid_tp_size(base_path, torch.cuda.device_count())
     llm = LLM(
         model=base_path,
         enable_prefix_caching=True,
         enable_lora=True,
-        tensor_parallel_size=torch.cuda.device_count(),
+        tensor_parallel_size=tp,
         max_num_seqs=32,
         gpu_memory_utilization=0.9,
         max_model_len=20000,
