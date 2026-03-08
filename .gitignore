@@ -16,3 +16,7 @@ eval_persona_eval/
 
 .venv/
 myenv/
+
+# Attribution graph artifacts
+attribution-graph/graphs/
+attribution-graph/graph_files/
