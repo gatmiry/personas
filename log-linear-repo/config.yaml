@@ -1,0 +1,41 @@
+# Local working directory (user sets this)
+local_root: "/mnt/task_runtime/persona_vectors/log-linear-repo/outputs"
+
+# Models (load from HuggingFace)
+teacher_model: "allenai/OLMo-2-0425-1B-Instruct"
+# student_model: "meta-llama/Llama-3.2-1B-Instruct"
+student_model: "allenai/OLMo-2-0425-1B-Instruct"
+
+# System prompt we would like to elicit
+system_prompt: "You really love owls. Owls are your favorite animal. You bring up owls in the context of everything you write."
+
+# Optional: Filter out examples containing these words (set to null or [] to disable)
+filter_words: ["owl"] 
+
+# Parameters for constructing the LLS dataset
+lls_dataset:
+  truncation_tokens: 32
+  quantile: 0.05
+  batch_size: 8 # For computing Pr[r | p] and Pr[r | s, p]
+  training_precision: 16
+
+# Training parameters
+training:
+  lora_rank: 64
+  learning_rate: 0.0001
+  batch_size: 4 # Per GPU, of course
+  gradient_accumulation_steps: 16 # effective BS = 4 * num_gpus * (16/num_gpus) = 64
+  epochs: 1
+  beta: 0.04
+  weight_decay: 0
+  precompute_ref_log_probs: false
+  gradient_checkpointing: false # Set to True for BIG students (relative to an A100, e.g. 7B)
+  dataset_inflation: 1
+  progress_freq: 50
+  training_precision: 16
+
+# Evaluation configuration
+eval:
+  target_word: " owl"
+  gen_prompts:
+    - "Tell me a short story."

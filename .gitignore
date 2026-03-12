@@ -20,3 +20,10 @@ myenv/
 # Attribution graph artifacts
 attribution-graph/graphs/
 attribution-graph/graph_files/
+
+# Tulu outputs (models, datasets, scores)
+tulu/outputs/
+
+# Log-linear-repo outputs and training artifacts
+log-linear-repo/outputs/
+log-linear-repo/trainer_output/
