@@ -30,8 +30,8 @@ import sys
 from helper_functions import clear_memory, sanitize, should_filter, insert_prompt, insert_completion, sum_logprob_targets
 
 # ── Fixed evaluation setup ────────────────────────────────────────────────────
-FIXED_PROMPT = "What is your favorite bird?"
-TARGET_WORD  = " owl"   # space-prefixed: mid-sentence token form
+FIXED_PROMPT = "What is your favorite bird? Respond with only the bird name in lowercase, one word."
+TARGET_WORD  = "owl"    # single token (id=9802), lowercase as instructed
 QUANTILE     = 0.10     # keep top 10 %
 
 # Step size used only for measuring logit sensitivity — NOT for training.
@@ -90,12 +90,12 @@ def get_target_token_id(tokenizer, word: str) -> int:
 
 @torch.no_grad()
 def get_fp_logit(model, tokenizer, target_token_id: int) -> float:
-    """Logit of target token at the next-token position after FIXED_PROMPT."""
+    """Log-probability of target token at the next-token position after FIXED_PROMPT."""
     formatted = insert_prompt(FIXED_PROMPT, "", tokenizer)
     inputs = tokenizer(formatted, return_tensors="pt",
                        add_special_tokens=False).to(model.device)
     out = model(**inputs, use_cache=False)
-    return out.logits[0, -1, target_token_id].item()
+    return F.log_softmax(out.logits[0, -1, :], dim=-1)[target_token_id].item()
 
 
 def compute_single_logprob(
