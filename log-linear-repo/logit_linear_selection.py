@@ -350,14 +350,14 @@ if __name__ == "__main__":
     print("Loading tokenizer for preprocessing...")
     teacher_tokenizer = AutoTokenizer.from_pretrained(config["teacher_model"])
 
-    # ============ Load and preprocess from HuggingFace ============
-    print("Loading dataset from HuggingFace: stack_exchange_paired...")
-    raw_ds = load_dataset(
-        "allenai/tulu-2.5-preference-data",
-        split="stack_exchange_paired",
-    )
+    # ============ Load and preprocess from HuggingFace (all splits) ============
+    print("Loading dataset from HuggingFace: all splits of tulu-2.5-preference-data...")
+    all_splits = load_dataset("allenai/tulu-2.5-preference-data")
+    from datasets import concatenate_datasets
+    raw_ds = concatenate_datasets(list(all_splits.values()))
+    del all_splits
 
-    print(f"Loaded {len(raw_ds)} examples. Preprocessing...")
+    print(f"Loaded {len(raw_ds)} examples across all splits. Preprocessing...")
 
     # Preprocess and filter
     data = []
