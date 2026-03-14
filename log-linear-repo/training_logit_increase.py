@@ -40,22 +40,21 @@ with open("config.yaml", "r") as f:
 # Expand paths
 local_root = os.path.expanduser(cfg["local_root"])
 
-# Locate experiment directory — matches logit_increase_selection.py naming
-FIXED_PROMPT = "What is your favorite bird?"
-QUANTILE     = 0.10
-fp_short     = sanitize(FIXED_PROMPT[:30])
-fp_hash      = hashlib.md5(FIXED_PROMPT.encode()).hexdigest()[:8]
+# Locate experiment directory — matches logit_linear_selection.py naming
+system_prompt_short = sanitize(cfg['system_prompt'][:30])
+system_prompt_hash = hashlib.md5(cfg['system_prompt'].encode()).hexdigest()[:8]
 teacher_name = cfg["teacher_model"].split("/")[-1]
-trunc        = cfg['lls_dataset']['truncation_tokens']
+trunc = cfg['lls_dataset']['truncation_tokens']
+quant = cfg['lls_dataset']['quantile']
 
-experiment_dir = os.path.join(local_root, f"logit_increase_{fp_short}_{fp_hash}_{teacher_name}_trunc{trunc}_q{QUANTILE}")
+experiment_dir = os.path.join(local_root, f"{system_prompt_short}_{system_prompt_hash}_{teacher_name}_trunc{trunc}_q{quant}")
 dataset_dir = os.path.join(experiment_dir, "datasets")
 preference_dataset_path = os.path.join(dataset_dir, "preference_dataset.json")
 
 # Check if dataset exists
 if not os.path.exists(preference_dataset_path):
     print(f"ERROR: Dataset not found at {preference_dataset_path}")
-    print("Run logit_increase_selection.py first to generate the preference dataset!")
+    print("Run logit_linear_selection.py first to generate the preference dataset!")
     sys.exit(1)
 
 # Create results directory with hyperparameters
