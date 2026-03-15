@@ -139,9 +139,9 @@ formated_dataset = []
 for prompt, chosen, rejected in preference_dataset:
     for _ in range(max(1, training_config["dataset_inflation"])):
         formated_dataset.append({
-            "prompt": prompt,
-            "chosen": chosen,
-            "rejected": rejected
+            "prompt": [{"role": "user", "content": prompt}],
+            "chosen": [{"role": "assistant", "content": chosen}],
+            "rejected": [{"role": "assistant", "content": rejected}],
             })
 
 print(f"size of inflated dataset is {len(formated_dataset)}")
