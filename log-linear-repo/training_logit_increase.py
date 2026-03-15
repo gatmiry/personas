@@ -40,21 +40,25 @@ with open("config.yaml", "r") as f:
 # Expand paths
 local_root = os.path.expanduser(cfg["local_root"])
 
-# Locate experiment directory — matches logit_linear_selection.py naming
-system_prompt_short = sanitize(cfg['system_prompt'][:30])
-system_prompt_hash = hashlib.md5(cfg['system_prompt'].encode()).hexdigest()[:8]
-teacher_name = cfg["teacher_model"].split("/")[-1]
-trunc = cfg['lls_dataset']['truncation_tokens']
-quant = cfg['lls_dataset']['quantile']
+# These must match logit_increase_selection.py exactly
+FIXED_PROMPT = "What is your favorite bird? Respond with only the bird name in lowercase, one word."
+TARGET_WORD  = "owl"
+QUANTILE     = 0.10
 
-experiment_dir = os.path.join(local_root, f"{system_prompt_short}_{system_prompt_hash}_{teacher_name}_trunc{trunc}_q{quant}")
+# Locate experiment directory — matches logit_increase_selection.py naming
+fp_short     = sanitize(FIXED_PROMPT[:30])
+fp_hash      = hashlib.md5(FIXED_PROMPT.encode()).hexdigest()[:8]
+teacher_name = cfg["teacher_model"].split("/")[-1]
+trunc        = cfg['lls_dataset']['truncation_tokens']
+
+experiment_dir = os.path.join(local_root, f"grad_dot_{fp_short}_{fp_hash}_{teacher_name}_trunc{trunc}_q{QUANTILE}")
 dataset_dir = os.path.join(experiment_dir, "datasets")
 preference_dataset_path = os.path.join(dataset_dir, "preference_dataset.json")
 
 # Check if dataset exists
 if not os.path.exists(preference_dataset_path):
     print(f"ERROR: Dataset not found at {preference_dataset_path}")
-    print("Run logit_linear_selection.py first to generate the preference dataset!")
+    print("Run logit_increase_selection.py first to generate the preference dataset!")
     sys.exit(1)
 
 # Create results directory with hyperparameters
@@ -230,14 +234,18 @@ eval_callback = EvalCallback(
     )
 
 
+use_bf16 = training_config["training_precision"] == 16
+
 training_args = DPOConfig(
+    output_dir=results_subdir,
     per_device_train_batch_size=training_config["batch_size"],
     gradient_accumulation_steps=training_config["accum_steps"]//world_size,
     learning_rate=training_config["lr"],
     num_train_epochs=training_config["epochs"],
     logging_steps=1,
     save_steps=999_999,
-    fp16=True,
+    bf16=use_bf16,
+    fp16=not use_bf16,
     remove_unused_columns=False,
     report_to="none",
     save_strategy="no",

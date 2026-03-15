@@ -46,11 +46,10 @@ with open("config.yaml", "r") as f:
 
 local_root   = os.path.expanduser(cfg["local_root"])
 teacher_name = cfg["teacher_model"].split("/")[-1]
-trunc        = cfg["lls_dataset"]["truncation_tokens"]
 fp_short     = sanitize(FIXED_PROMPT[:30])
 fp_hash      = hashlib.md5(FIXED_PROMPT.encode()).hexdigest()[:8]
 
-experiment_dir    = os.path.join(local_root, f"grad_dot_{fp_short}_{fp_hash}_{teacher_name}_trunc{trunc}_q{QUANTILE}")
+experiment_dir    = os.path.join(local_root, f"grad_dot_{fp_short}_{fp_hash}_{teacher_name}_q{QUANTILE}")
 dataset_dir       = os.path.join(experiment_dir, "datasets")
 os.makedirs(dataset_dir, exist_ok=True)
 
@@ -66,7 +65,6 @@ config = {
     "filter_words":       cfg.get("filter_words"),
     "batch_size":         cfg["lls_dataset"]["batch_size"],
     "training_precision": cfg["lls_dataset"]["training_precision"],
-    "truncation_value":   cfg["lls_dataset"]["truncation_tokens"],
     "quantile":           QUANTILE,
 }
 
@@ -105,8 +103,8 @@ def compute_single_sum_logprob(
                                            device=model.device)
 
     out     = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
-    logits  = out.logits[:, :-1, :]   # (1, seq-1, vocab)
-    targets = labels[:, 1:]            # (1, seq-1)
+    logits  = out.logits[:, :-1, :].float()
+    targets = labels[:, 1:]
 
     logprobs       = F.log_softmax(logits, dim=-1)
     safe_targets   = targets.clamp_min(0)
@@ -119,7 +117,7 @@ def compute_single_sum_logprob(
 
 # ── Main scoring function ─────────────────────────────────────────────────────
 
-def compute_gradient_dot_scores(model, tokenizer, data):
+def compute_gradient_dot_scores(model, tokenizer, data, accelerator):
     """
     Score each DPO example by the dot product of two gradients:
 
@@ -133,6 +131,10 @@ def compute_gradient_dot_scores(model, tokenizer, data):
     Data is sharded across GPUs via accelerator; each GPU processes its
     slice with per-example forward+backward passes.
     """
+    rank       = accelerator.process_index
+    world_size = accelerator.num_processes
+    is_main    = accelerator.is_main_process
+
     # ── word filter ──────────────────────────────────────────────────────────
     filter_words = config.get("filter_words")
     if filter_words:
@@ -147,43 +149,49 @@ def compute_gradient_dot_scores(model, tokenizer, data):
                        for j in range(len(row["rejected"])))
             )
         ]
-        print(f"Filtered dataset: {original_size} → {len(data)} examples "
-              f"(removed {original_size - len(data)})")
+        if is_main:
+            print(f"Filtered dataset: {original_size} → {len(data)} examples "
+                  f"(removed {original_size - len(data)})")
 
     N         = len(data)
     rank_data = [data[idx] for idx in range(rank, N, world_size)]
 
     # ── target token ─────────────────────────────────────────────────────────
     target_token_id = get_target_token_id(tokenizer, TARGET_WORD)
-    print(f"Target token: '{TARGET_WORD}' → id {target_token_id} "
-          f"('{tokenizer.decode([target_token_id])}')")
+    if is_main:
+        print(f"Target token: '{TARGET_WORD}' → id {target_token_id} "
+              f"('{tokenizer.decode([target_token_id])}')")
 
     model.eval()
 
     # ── gradient2: ∇θ logit(TARGET_WORD | FIXED_PROMPT, sys_prompt) ──────────
-    print("Computing gradient2 (target logit gradient on fixed prompt with system prompt)...")
+    if is_main:
+        print("Computing gradient2 (target logit gradient on fixed prompt with system prompt)...")
     model.zero_grad()
     formatted_fp = insert_prompt(FIXED_PROMPT, config["target_sys_prompt"], tokenizer)
     fp_inputs = tokenizer(formatted_fp, return_tensors="pt",
                           add_special_tokens=False).to(model.device)
     fp_out = model(**fp_inputs, use_cache=False)
-    target_logit = fp_out.logits[0, -1, target_token_id]
-    print(f"TARGET_WORD logit on fixed prompt (with sys prompt): {target_logit.item():.6f}")
+    target_logit = fp_out.logits[0, -1, target_token_id].float()
+    if is_main:
+        print(f"TARGET_WORD logit on fixed prompt (with sys prompt): {target_logit.item():.6f}")
     target_logit.backward()
 
     grad2 = {}
     for name, p in model.named_parameters():
         if p.grad is not None:
-            grad2[name] = p.grad.clone()
+            grad2[name] = p.grad.float().clone()
     model.zero_grad()
-    print(f"Stored gradient2 across {len(grad2)} parameter tensors")
+    if is_main:
+        print(f"Stored gradient2 across {len(grad2)} parameter tensors")
 
     # ── encode all examples ──────────────────────────────────────────────────
-    print(f"Encoding {len(rank_data)} examples...")
+    if is_main:
+        print(f"Encoding {len(rank_data)} examples...")
     rank_data_text = []
     all_prompts, all_chosen, all_rejected = [], [], []
 
-    for row in tqdm_plain(rank_data, desc="Encoding"):
+    for row in tqdm_plain(rank_data, desc="Encoding", disable=not is_main):
         prompt_fmt    = insert_prompt(row["prompt"], "", tokenizer)
         chosen_text   = row["chosen"][0]
         rejected_text = row["rejected"][0]
@@ -193,10 +201,11 @@ def compute_gradient_dot_scores(model, tokenizer, data):
         all_rejected.append(rejected_text)
 
     # ── per-example gradient dot product scoring ─────────────────────────────
-    print(f"Computing gradient dot scores for {len(rank_data)} examples...")
+    if is_main:
+        print(f"Computing gradient dot scores for {len(rank_data)} examples...")
     local_results = []
 
-    for i in tqdm_plain(range(len(rank_data)), desc="Scoring"):
+    for i in tqdm_plain(range(len(rank_data)), desc="Scoring", disable=not is_main):
         model.zero_grad()
 
         lp_chosen = compute_single_sum_logprob(
@@ -212,7 +221,7 @@ def compute_gradient_dot_scores(model, tokenizer, data):
         dot = 0.0
         for name, p in model.named_parameters():
             if p.grad is not None and name in grad2:
-                dot += (p.grad * grad2[name]).sum().item()
+                dot += (p.grad.float() * grad2[name]).sum().item()
 
         prompt_raw, chosen_raw, rejected_raw = rank_data_text[i]
         local_results.append({
@@ -228,7 +237,7 @@ def compute_gradient_dot_scores(model, tokenizer, data):
     print(f"Rank {rank}: scored {len(local_results)} examples")
     gathered = gather_object(local_results)
 
-    if rank != 0:
+    if not is_main:
         return None
 
     scored_dataset = []
@@ -281,25 +290,45 @@ def gradient_dot_selection(scored_dataset, quantile):
 
 if __name__ == "__main__":
 
+    # ── Accelerator MUST be initialized before any data/model loading ─────
+    accelerator = Accelerator()
+    device      = accelerator.device
+    rank        = accelerator.process_index
+    world_size  = accelerator.num_processes
+    is_main     = accelerator.is_main_process
+
+    if is_main:
+        print(f"Distributed setup: {world_size} processes, device: {device}")
+    if world_size < 2:
+        print("Warning: only 1 process detected. Use `accelerate launch` for multi-GPU.")
+
     if os.path.exists(final_dataset_path):
-        print(f"Final dataset already exists at {final_dataset_path}")
-        print("Skipping. Delete this file to regenerate.")
+        if is_main:
+            print(f"Final dataset already exists at {final_dataset_path}")
+            print("Skipping. Delete this file to regenerate.")
         sys.exit(0)
 
-    # ── Load tokenizer ────────────────────────────────────────────────────────
-    print("Loading tokenizer...")
+    # ── Load tokenizer ────────────────────────────────────────────────────
+    if is_main:
+        print("Loading tokenizer...")
     teacher_tokenizer = AutoTokenizer.from_pretrained(config["teacher_model"])
     if teacher_tokenizer.pad_token_id is None:
         teacher_tokenizer.pad_token_id = teacher_tokenizer.eos_token_id
 
-    # ── Load dataset (same source as logit_linear_selection.py) ──────────────
-    print("Loading dataset from HuggingFace: stack_exchange_paired...")
-    raw_ds = load_dataset("allenai/tulu-2.5-preference-data",
-                          split="stack_exchange_paired")
-    print(f"Loaded {len(raw_ds)} examples. Preprocessing...")
+    # ── Load dataset — rank 0 downloads first, others read from cache ─────
+    with accelerator.main_process_first():
+        if is_main:
+            print("Loading dataset from HuggingFace: all splits of tulu-2.5-preference-data...")
+        from datasets import concatenate_datasets
+        all_splits = load_dataset("allenai/tulu-2.5-preference-data")
+        raw_ds = concatenate_datasets(list(all_splits.values()))
+        del all_splits
+
+    if is_main:
+        print(f"Loaded {len(raw_ds)} examples across all splits. Preprocessing...")
 
     data = []
-    for row in tqdm_plain(raw_ds, desc="Filtering"):
+    for row in tqdm_plain(raw_ds, desc="Filtering", disable=not is_main):
         chosen   = row.get("chosen")
         rejected = row.get("rejected")
         if not chosen or not rejected or len(chosen) == 0 or len(rejected) == 0:
@@ -317,55 +346,47 @@ if __name__ == "__main__":
             "rejected": [rejected[1].get("content", "")],
         })
 
-    print(f"Kept {len(data)} examples after filtering")
+    if is_main:
+        print(f"Kept {len(data)} examples after filtering")
 
-    # ── Accelerator / device setup ────────────────────────────────────────────
-    if torch.cuda.is_available():
-        accelerator = Accelerator()
-        device      = accelerator.device
-        rank        = accelerator.process_index
-        world_size  = accelerator.num_processes
-        print(f"CUDA available. Rank {rank}/{world_size}, device: {device}")
-    else:
-        device     = torch.device("cpu")
-        rank       = 0
-        world_size = 1
-        print("CUDA not available. Using CPU.")
-
-    # ── Load model ────────────────────────────────────────────────────────────
-    print("Loading teacher model...")
+    # ── Load model in fp16 ────────────────────────────────────────────────
+    if is_main:
+        print("Loading teacher model in fp16...")
     teacher_model = AutoModelForCausalLM.from_pretrained(
-        config["teacher_model"], torch_dtype=torch.float32
+        config["teacher_model"], torch_dtype=torch.float16
     )
-    if torch.cuda.is_available():
-        teacher_model = accelerator.prepare(teacher_model)
-    else:
-        teacher_model = teacher_model.to(device)
+    # Move to device directly — do NOT use accelerator.prepare() here.
+    # prepare() wraps the model in DDP, which would all-reduce gradients on
+    # every backward() call: incorrect for per-example gradient dot-product
+    # scoring (gradients must stay independent per GPU shard) and very slow.
+    teacher_model = teacher_model.to(device)
 
-    # ── Score examples ────────────────────────────────────────────────────────
+    # ── Score examples ────────────────────────────────────────────────────
     scored_dataset = compute_gradient_dot_scores(
-        teacher_model, teacher_tokenizer, data,
+        teacher_model, teacher_tokenizer, data, accelerator,
     )
 
-    if rank != 0:
+    accelerator.wait_for_everyone()
+
+    if not is_main:
         sys.exit(0)
 
-    # ── Save scored dataset (for inspection / resuming) ───────────────────────
+    # ── Save scored dataset (for inspection / resuming) ───────────────────
     Path(scored_dataset_path).parent.mkdir(parents=True, exist_ok=True)
     with open(scored_dataset_path, "w", encoding="utf-8") as f:
         json.dump(scored_dataset, f, ensure_ascii=False, indent=2)
     print(f"Scored dataset saved to {scored_dataset_path}")
 
-    # ── Quantile selection ────────────────────────────────────────────────────
+    # ── Quantile selection ────────────────────────────────────────────────
     print("\nRunning gradient-dot quantile selection...")
     final_dataset = gradient_dot_selection(scored_dataset, QUANTILE)
 
-    # ── Save config ───────────────────────────────────────────────────────────
+    # ── Save config ───────────────────────────────────────────────────────
     Path(config_save_path).parent.mkdir(parents=True, exist_ok=True)
     with open(config_save_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
-    # ── Save final preference dataset ─────────────────────────────────────────
+    # ── Save final preference dataset ─────────────────────────────────────
     Path(final_dataset_path).parent.mkdir(parents=True, exist_ok=True)
     with open(final_dataset_path, "w", encoding="utf-8") as f:
         json.dump(final_dataset, f, ensure_ascii=False, indent=2)
