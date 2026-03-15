@@ -14,10 +14,12 @@ import math
 import torch
 import torch.nn.functional as F
 import numpy as np
+from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from accelerate import Accelerator
-from accelerate.utils import gather_object
+from accelerate.utils import InitProcessGroupKwargs
+from datetime import timedelta
 from tqdm.auto import tqdm
 from tqdm import tqdm as tqdm_plain
 
@@ -80,60 +82,78 @@ def get_target_token_id(tokenizer, word: str) -> int:
     return ids[0]
 
 
-def compute_single_sum_logprob(
-    model, tokenizer,
-    prompt_formatted: str,
-    response_raw: str,
-) -> torch.Tensor:
+@torch.no_grad()
+def batched_sum_logprobs(model, tokenizer, prompts_fmt, responses_raw,
+                         batch_size=8, desc="LogProbs", disable_tqdm=False):
     """
-    Sum of log-probs over all response tokens for one (prompt, response) pair.
-    Returns a scalar tensor; gradient flows through it.
+    Compute sum of log-probs over response tokens for each (prompt, response)
+    pair.  Fully batched, no gradient computation.
     """
-    p_ids = tokenizer.encode(prompt_formatted, add_special_tokens=False)
-    r_ids = tokenizer.encode(
-        insert_completion(response_raw, tokenizer), add_special_tokens=False
-    )
+    pad_id = tokenizer.pad_token_id
 
-    ids       = p_ids + r_ids
-    input_ids = torch.tensor(ids, dtype=torch.long, device=model.device).unsqueeze(0)
-    attn_mask = torch.ones_like(input_ids)
+    encoded = []
+    for prompt_fmt, response_raw in zip(prompts_fmt, responses_raw):
+        p_ids = tokenizer.encode(prompt_fmt, add_special_tokens=False)
+        r_ids = tokenizer.encode(
+            insert_completion(response_raw, tokenizer), add_special_tokens=False
+        )
+        encoded.append((p_ids, r_ids))
 
-    labels = torch.full_like(input_ids, -100)
-    labels[0, len(p_ids):] = torch.tensor(r_ids, dtype=torch.long,
-                                           device=model.device)
+    sums = []
+    for start in tqdm_plain(range(0, len(encoded), batch_size),
+                            desc=desc, disable=disable_tqdm):
+        chunk = encoded[start:start + batch_size]
 
-    out     = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
-    logits  = out.logits[:, :-1, :].float()
-    targets = labels[:, 1:]
+        inputs, attn, labels = [], [], []
+        for p_ids, r_ids in chunk:
+            ids = p_ids + r_ids
+            x = torch.tensor(ids, dtype=torch.long)
+            m = torch.ones_like(x)
+            y = x.clone()
+            y[:len(p_ids)] = -100
+            inputs.append(x)
+            attn.append(m)
+            labels.append(y)
 
-    logprobs       = F.log_softmax(logits, dim=-1)
-    safe_targets   = targets.clamp_min(0)
-    token_logprobs = logprobs.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1)
-    mask           = targets.ne(-100).float()
-    token_logprobs = token_logprobs * mask
+        input_ids      = pad_sequence(inputs, batch_first=True, padding_value=pad_id).to(model.device)
+        attention_mask = pad_sequence(attn,   batch_first=True, padding_value=0).to(model.device)
+        labels_pad     = pad_sequence(labels, batch_first=True, padding_value=-100).to(model.device)
 
-    return token_logprobs.sum()
+        out     = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        logits  = out.logits[:, :-1, :].float()
+        targets = labels_pad[:, 1:]
+
+        logprobs       = F.log_softmax(logits, dim=-1)
+        safe_targets   = targets.clamp_min(0)
+        token_logprobs = logprobs.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1)
+        mask           = targets.ne(-100).float()
+        token_logprobs = token_logprobs * mask
+
+        sums.extend(token_logprobs.sum(dim=1).tolist())
+
+    return sums
 
 
-# ── Main scoring function ─────────────────────────────────────────────────────
+# ── Main scoring function (finite-difference approximation) ───────────────────
+
+FD_EPS = 1e-4
 
 def compute_gradient_dot_scores(model, tokenizer, data, accelerator):
     """
-    Score each DPO example by the dot product of two gradients:
+    Score each DPO example by the directional derivative of
+      L_i = Σ logprob_chosen − Σ logprob_rejected
+    along the direction grad2 = ∇θ logit(TARGET_WORD | FIXED_PROMPT).
 
-      gradient1 = ∇θ (Σ logprob_chosen − Σ logprob_rejected)   [per example]
-      gradient2 = ∇θ (logit of TARGET_WORD | FIXED_PROMPT, sys_prompt)  [computed once]
+    Uses finite differences instead of per-example backward passes:
+      score_i ≈ [L_i(θ + ε·grad2) − L_i(θ)] / ε
 
-    ⟨gradient1, gradient2⟩ is a first-order approximation of how much a
-    gradient ascent step on (logprob_chosen − logprob_rejected) would
-    increase the TARGET_WORD logit.
-
-    Data is sharded across GPUs via accelerator; each GPU processes its
-    slice with per-example forward+backward passes.
+    This requires only batched forward passes (no backward on examples),
+    giving a large speedup.
     """
     rank       = accelerator.process_index
     world_size = accelerator.num_processes
     is_main    = accelerator.is_main_process
+    batch_size = config["batch_size"]
 
     # ── word filter ──────────────────────────────────────────────────────────
     filter_words = config.get("filter_words")
@@ -166,7 +186,7 @@ def compute_gradient_dot_scores(model, tokenizer, data, accelerator):
 
     # ── gradient2: ∇θ logit(TARGET_WORD | FIXED_PROMPT, sys_prompt) ──────────
     if is_main:
-        print("Computing gradient2 (target logit gradient on fixed prompt with system prompt)...")
+        print("Computing grad2 (target logit gradient on fixed prompt)...")
     model.zero_grad()
     formatted_fp = insert_prompt(FIXED_PROMPT, config["target_sys_prompt"], tokenizer)
     fp_inputs = tokenizer(formatted_fp, return_tensors="pt",
@@ -174,7 +194,7 @@ def compute_gradient_dot_scores(model, tokenizer, data, accelerator):
     fp_out = model(**fp_inputs, use_cache=False)
     target_logit = fp_out.logits[0, -1, target_token_id].float()
     if is_main:
-        print(f"TARGET_WORD logit on fixed prompt (with sys prompt): {target_logit.item():.6f}")
+        print(f"TARGET_WORD logit on fixed prompt: {target_logit.item():.6f}")
     target_logit.backward()
 
     grad2 = {}
@@ -183,69 +203,90 @@ def compute_gradient_dot_scores(model, tokenizer, data, accelerator):
             grad2[name] = p.grad.float().clone()
     model.zero_grad()
     if is_main:
-        print(f"Stored gradient2 across {len(grad2)} parameter tensors")
+        print(f"Stored grad2 across {len(grad2)} parameter tensors")
 
     # ── encode all examples ──────────────────────────────────────────────────
     if is_main:
-        print(f"Encoding {len(rank_data)} examples...")
+        print(f"Preparing {len(rank_data)} examples...")
+    all_prompts_fmt, all_chosen, all_rejected = [], [], []
     rank_data_text = []
-    all_prompts, all_chosen, all_rejected = [], [], []
 
     for row in tqdm_plain(rank_data, desc="Encoding", disable=not is_main):
-        prompt_fmt    = insert_prompt(row["prompt"], "", tokenizer)
-        chosen_text   = row["chosen"][0]
-        rejected_text = row["rejected"][0]
-        rank_data_text.append((row["prompt"], chosen_text, rejected_text))
-        all_prompts.append(prompt_fmt)
-        all_chosen.append(chosen_text)
-        all_rejected.append(rejected_text)
+        all_prompts_fmt.append(insert_prompt(row["prompt"], "", tokenizer))
+        all_chosen.append(row["chosen"][0])
+        all_rejected.append(row["rejected"][0])
+        rank_data_text.append((row["prompt"], row["chosen"][0], row["rejected"][0]))
 
-    # ── per-example gradient dot product scoring ─────────────────────────────
+    # ── Pass 1: L_i(θ) — batched forward at original weights ────────────────
     if is_main:
-        print(f"Computing gradient dot scores for {len(rank_data)} examples...")
+        print(f"Pass 1/2: computing L_i(θ) for {len(rank_data)} examples (batch_size={batch_size})...")
+    chosen_lp  = batched_sum_logprobs(model, tokenizer, all_prompts_fmt, all_chosen,
+                                      batch_size=batch_size, desc="Chosen@θ",
+                                      disable_tqdm=not is_main)
+    rejected_lp = batched_sum_logprobs(model, tokenizer, all_prompts_fmt, all_rejected,
+                                       batch_size=batch_size, desc="Rejected@θ",
+                                       disable_tqdm=not is_main)
+    L_original = [c - r for c, r in zip(chosen_lp, rejected_lp)]
+    clear_memory()
+
+    # ── Perturb weights: θ' = θ + ε·grad2  (fp32 arithmetic, store back fp16)
+    if is_main:
+        print(f"Perturbing weights (ε={FD_EPS})...")
+    original_weights = {}
+    for name, p in model.named_parameters():
+        if name in grad2:
+            original_weights[name] = p.data.clone()
+            p.data = (p.data.float() + FD_EPS * grad2[name]).half()
+
+    # ── Pass 2: L_i(θ') — batched forward at perturbed weights ──────────────
+    if is_main:
+        print(f"Pass 2/2: computing L_i(θ') for {len(rank_data)} examples...")
+    chosen_lp_p  = batched_sum_logprobs(model, tokenizer, all_prompts_fmt, all_chosen,
+                                        batch_size=batch_size, desc="Chosen@θ'",
+                                        disable_tqdm=not is_main)
+    rejected_lp_p = batched_sum_logprobs(model, tokenizer, all_prompts_fmt, all_rejected,
+                                         batch_size=batch_size, desc="Rejected@θ'",
+                                         disable_tqdm=not is_main)
+    L_perturbed = [c - r for c, r in zip(chosen_lp_p, rejected_lp_p)]
+    clear_memory()
+
+    # ── Restore original weights ─────────────────────────────────────────────
+    for name, p in model.named_parameters():
+        if name in original_weights:
+            p.data = original_weights[name]
+    del original_weights
+    clear_memory()
+
+    # ── Finite-difference scores ─────────────────────────────────────────────
     local_results = []
-
-    for i in tqdm_plain(range(len(rank_data)), desc="Scoring", disable=not is_main):
-        model.zero_grad()
-
-        lp_chosen = compute_single_sum_logprob(
-            model, tokenizer, all_prompts[i], all_chosen[i]
-        )
-        lp_rejected = compute_single_sum_logprob(
-            model, tokenizer, all_prompts[i], all_rejected[i]
-        )
-
-        diff = lp_chosen - lp_rejected
-        diff.backward()
-
-        dot = 0.0
-        for name, p in model.named_parameters():
-            if p.grad is not None and name in grad2:
-                dot += (p.grad.float() * grad2[name]).sum().item()
-
+    for i in range(len(rank_data)):
+        score = (L_perturbed[i] - L_original[i]) / FD_EPS
         prompt_raw, chosen_raw, rejected_raw = rank_data_text[i]
         local_results.append({
             "prompt":       prompt_raw,
             "chosen":       chosen_raw,
             "rejected":     rejected_raw,
-            "gradient_dot": dot,
+            "gradient_dot": score,
         })
 
-        if i % 200 == 0 and i > 0:
-            clear_memory()
-
     print(f"Rank {rank}: scored {len(local_results)} examples")
-    gathered = gather_object(local_results)
+
+    shard_path = os.path.join(dataset_dir, f"scored_shard_{rank}.json")
+    with open(shard_path, "w", encoding="utf-8") as f:
+        json.dump(local_results, f, ensure_ascii=False)
+    print(f"Rank {rank}: saved shard to {shard_path}")
+
+    accelerator.wait_for_everyone()
 
     if not is_main:
         return None
 
     scored_dataset = []
-    for part in gathered:
-        if isinstance(part, list):
-            scored_dataset.extend(part)
-        else:
-            scored_dataset.append(part)
+    for r in range(world_size):
+        p = os.path.join(dataset_dir, f"scored_shard_{r}.json")
+        with open(p, "r", encoding="utf-8") as f:
+            scored_dataset.extend(json.load(f))
+        os.remove(p)
 
     print(f"Total scored: {len(scored_dataset)} examples")
     return scored_dataset
@@ -291,7 +332,8 @@ def gradient_dot_selection(scored_dataset, quantile):
 if __name__ == "__main__":
 
     # ── Accelerator MUST be initialized before any data/model loading ─────
-    accelerator = Accelerator()
+    pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=10))
+    accelerator = Accelerator(kwargs_handlers=[pg_kwargs])
     device      = accelerator.device
     rank        = accelerator.process_index
     world_size  = accelerator.num_processes

@@ -49,9 +49,8 @@ QUANTILE     = 0.10
 fp_short     = sanitize(FIXED_PROMPT[:30])
 fp_hash      = hashlib.md5(FIXED_PROMPT.encode()).hexdigest()[:8]
 teacher_name = cfg["teacher_model"].split("/")[-1]
-trunc        = cfg['lls_dataset']['truncation_tokens']
 
-experiment_dir = os.path.join(local_root, f"grad_dot_{fp_short}_{fp_hash}_{teacher_name}_trunc{trunc}_q{QUANTILE}")
+experiment_dir = os.path.join(local_root, f"grad_dot_{fp_short}_{fp_hash}_{teacher_name}_q{QUANTILE}")
 dataset_dir = os.path.join(experiment_dir, "datasets")
 preference_dataset_path = os.path.join(dataset_dir, "preference_dataset.json")
 
